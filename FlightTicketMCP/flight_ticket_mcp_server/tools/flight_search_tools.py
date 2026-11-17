@@ -83,6 +83,9 @@ LANGUAGES = [
 # 浏览器用户数据目录（用于持久化 Cookie 和会话，绕过验证码）
 import os
 import sys
+import socket
+import subprocess
+import urllib.request
 
 # =================== 浏览器自动检测 ===================
 
@@ -174,6 +177,130 @@ def get_browser_data_dir():
     return browser_data_dir
 
 BROWSER_USER_DATA_DIR = get_browser_data_dir()
+
+
+# =================== 浏览器启动（规避携程 whaleguard 拦截） ===================
+#
+# 说明：
+# 1. DrissionPage 自带的 ChromiumPage(options) 启动流程在当前 Chrome 版本下建立
+#    不到调试连接；
+# 2. 它默认写入的自动化参数（伪造旧版 UA、--no-sandbox 等）会被携程 whaleguard
+#    识别，返回 432「whaleguard block」拦截页；
+# 3. 因此改为：先用 subprocess 以普通参数启动本机 Chrome（开放调试端口），
+#    再用 DrissionPage 附加（attach）到该浏览器。
+
+def _find_free_local_port(start: int = 9223, end: int = 9400) -> int:
+    """找一个本地可用端口"""
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("没有可用端口用于浏览器调试")
+
+
+def _wait_debug_port(port: int, timeout: float = 25.0) -> bool:
+    """等待 Chrome 调试端口就绪"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.4)
+    return False
+
+
+def _parse_duration_minutes(text: str) -> int:
+    """
+    解析时长文本为分钟数，支持：
+    "1d45m" / "23h" / "11h55m"（携程页面格式）
+    "1天45分" / "2小时15分钟" / "45分钟"（中文格式）
+    """
+    if not text:
+        return 0
+    text = str(text).strip()
+    total = 0
+    matched = False
+
+    day_match = re.search(r'(\d+)\s*(?:d|天)', text)
+    if day_match:
+        total += int(day_match.group(1)) * 24 * 60
+        matched = True
+    hour_match = re.search(r'(\d+)\s*(?:h|小时)', text)
+    if hour_match:
+        total += int(hour_match.group(1)) * 60
+        matched = True
+    minute_match = re.search(r'(\d+)\s*(?:m|分钟|分)', text)
+    if minute_match:
+        total += int(minute_match.group(1))
+        matched = True
+
+    return total if matched else 0
+
+
+def _clear_singleton_locks(user_data_dir: str):
+    """清理上次异常退出留下的单例锁文件"""
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            os.remove(os.path.join(user_data_dir, name))
+        except OSError:
+            pass
+
+
+def launch_chrome_for_attach(user_data_dir: str, headless: bool = False):
+    """
+    以普通浏览器参数启动 Chrome 并开放调试端口，返回 (进程, 端口)。
+
+    Args:
+        user_data_dir: Chrome 用户数据目录（持久化 Cookie）
+        headless: 是否无头模式（注意：携程 whaleguard 会拦截无头浏览器）
+    """
+    if not DETECTED_BROWSER_PATH:
+        raise RuntimeError("未检测到 Chrome/Edge/Chromium 浏览器")
+
+    # 调试/受限环境下可预先启动 Chrome，并通过环境变量指定调试端口直接附加
+    env_port = os.environ.get("GO_HOME_CHROME_DEBUG_PORT")
+    if env_port:
+        try:
+            port = int(env_port)
+            if _wait_debug_port(port, timeout=3):
+                logger.info(f"附加到已运行的浏览器调试端口 {port}")
+                return None, port
+        except ValueError:
+            logger.warning(f"无效的 GO_HOME_CHROME_DEBUG_PORT: {env_port}")
+
+    _clear_singleton_locks(user_data_dir)
+    port = _find_free_local_port()
+    args = [
+        DETECTED_BROWSER_PATH,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-popup-blocking",
+        "--window-size=1600,1000",
+        "--lang=zh-CN",
+    ]
+    if headless:
+        args.insert(1, "--headless=new")
+    args.append("about:blank")
+
+    logger.info(f"启动浏览器: {DETECTED_BROWSER_NAME} (调试端口 {port})")
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if not _wait_debug_port(port):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError(f"Chrome 调试端口 {port} 启动超时")
+
+    return proc, port
 
 
 def create_browser_options(headless: bool = True, use_user_data: bool = True) -> 'ChromiumOptions':
@@ -286,8 +413,34 @@ class FlightRouteSearcher:
         self.headless = headless
         self.base_url = "https://flights.ctrip.com/online/list/oneway-{}-{}?_=1&depdate={}&cabin=Y_S_C_F"
         self.page = None  # 延迟创建
+        self._browser_proc = None  # 外部启动的 Chrome 进程
+        self._external_browser = False  # 是否附加到外部管理的浏览器
 
         logger.info("航班路线查询器初始化完成（每次请求将创建新浏览器实例）")
+
+    def _close_page(self):
+        """关闭页面连接并结束外部启动的 Chrome 进程"""
+        if self.page:
+            try:
+                if getattr(self, "_external_browser", False):
+                    # 浏览器由外部管理（GO_HOME_CHROME_DEBUG_PORT），只断开连接不关闭浏览器
+                    self.page.disconnect()
+                else:
+                    self.page.quit()
+            except Exception:
+                pass
+            self.page = None
+        proc = getattr(self, "_browser_proc", None)
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._browser_proc = None
 
     def _create_new_browser(self):
         """
@@ -296,39 +449,17 @@ class FlightRouteSearcher:
         每次调用都会生成不同的浏览器指纹，模拟不同用户访问
         """
         # 关闭旧的浏览器（如果存在）
-        if self.page:
-            try:
-                self.page.quit()
-            except:
-                pass
+        self._close_page()
 
         try:
-            # 创建带有随机配置的新浏览器
             logger.info("正在创建浏览器实例...")
-            co = create_browser_options(self.headless)
-
-            try:
-                self.page = ChromiumPage(co)
-            except Exception as browser_error:
-                error_msg = str(browser_error).lower()
-                logger.error(f"创建浏览器实例失败: {browser_error}")
-
-                # 检测是否是文件锁问题
-                if 'lock' in error_msg or 'singleton' in error_msg or 'in use' in error_msg:
-                    logger.warning("检测到浏览器用户数据目录被锁定！")
-                    logger.warning("可能的原因：")
-                    logger.warning("  1. 有其他 Chrome/Edge 进程正在使用该目录")
-                    logger.warning("  2. 上次浏览器崩溃，留下了锁文件")
-                    logger.warning("建议操作：")
-                    logger.warning("  1. 在主界面点击「启动服务」时选择「清除Cookie」")
-                    logger.warning("  2. 或手动关闭所有 Chrome/Edge 进程后重试")
-
-                logger.info("尝试使用默认配置创建浏览器（不使用用户数据目录）...")
-
-                # 尝试不使用用户数据目录
-                co_fallback = create_browser_options(self.headless, use_user_data=False)
-                self.page = ChromiumPage(co_fallback)
-                logger.warning("使用默认配置创建浏览器成功（Cookie 将不会被保存，可能需要重新验证）")
+            # 加固说明：使用「外部启动 + 附加」方式，避免自动化指纹被携程拦截。
+            # 无头模式会被 whaleguard 拦截，因此始终使用带界面的浏览器。
+            proc, port = launch_chrome_for_attach(BROWSER_USER_DATA_DIR, headless=False)
+            self._browser_proc = proc
+            self._external_browser = proc is None
+            self.page = ChromiumPage(f"127.0.0.1:{port}")
+            logger.info(f"浏览器实例创建成功（调试端口 {port}）")
 
             # 添加随机延迟，模拟真实用户行为
             delay = random.uniform(0.5, 1.5)
@@ -396,8 +527,7 @@ class FlightRouteSearcher:
                     logger.warning("检测到验证码！尝试使用非无头模式让用户手动处理...")
 
                 # 关闭当前浏览器
-                self.page.quit()
-                self.page = None
+                self._close_page()
 
                 # 使用非无头模式重新创建浏览器，传递操作类型
                 self._create_new_browser_for_captcha(search_url, action_type or 'captcha')
@@ -429,13 +559,9 @@ class FlightRouteSearcher:
 
         finally:
             # 【关键】搜索完成后立即关闭浏览器，释放资源
-            if self.page:
-                try:
-                    self.page.quit()
-                    self.page = None
-                    logger.debug("浏览器实例已关闭")
-                except:
-                    pass
+            if self.page or self._browser_proc:
+                self._close_page()
+                logger.debug("浏览器实例已关闭")
 
     def _detect_captcha_or_login(self) -> tuple:
         """
@@ -580,9 +706,11 @@ class FlightRouteSearcher:
         else:
             logger.info("创建可视化浏览器窗口，请手动完成验证码...")
 
-        # 创建非无头模式的浏览器
-        co = create_browser_options(headless=False, use_user_data=True)
-        self.page = ChromiumPage(co)
+        # 创建非无头模式的浏览器（外部启动 + 附加）
+        proc, port = launch_chrome_for_attach(BROWSER_USER_DATA_DIR, headless=False)
+        self._browser_proc = proc
+        self._external_browser = proc is None
+        self.page = ChromiumPage(f"127.0.0.1:{port}")
 
         # 访问页面
         self.page.get(url)
@@ -897,15 +1025,28 @@ class FlightRouteSearcher:
             transfer_info = container.ele('css:.transfer-info', timeout=1)
             if transfer_info:
                 transfer_detail = transfer_info.text.strip()
-                # 格式如: "转中国香港1h35m" 或 "转香港2h15m"
-                # 提取中转城市和等待时间
-                transfer_match = re.search(r'转(.+?)(\d+h\d+m|\d+小时\d+分钟?)', transfer_detail)
+                # 格式如: "转乌鲁木齐1d45m" / "转乌鲁木齐1天45分" / "转香港2h15m"
+                flight_info['中转信息'] = transfer_detail
+                transfer_match = re.search(
+                    r'转\s*(.+?)\s*(\d+天\d+[分小].*|\d+d(?:\d+h)?(?:\d+m)?|\d+h(?:\d+m)?|\d+小时(?:\d+分(?:钟)?)?|\d+分(?:钟)?)',
+                    transfer_detail,
+                )
                 if transfer_match:
                     flight_info['中转城市'] = transfer_match.group(1).strip()
                     flight_info['中转等待'] = transfer_match.group(2).strip()
-                else:
-                    # 尝试其他格式
-                    flight_info['中转信息'] = transfer_detail
+                    wait_minutes = _parse_duration_minutes(flight_info['中转等待'])
+                    if wait_minutes:
+                        flight_info['中转等待分钟'] = wait_minutes
+
+            # 解析中转总时长（如 "中转1天45分"）
+            transfer_duration = container.ele('css:.transfer-duration', timeout=1)
+            if transfer_duration:
+                duration_text = transfer_duration.text.strip()
+                duration_text = re.sub(r'^中转', '', duration_text).strip()
+                flight_info['总时长'] = duration_text
+                total_minutes = _parse_duration_minutes(duration_text)
+                if total_minutes:
+                    flight_info['总时长分钟'] = total_minutes
 
             # 解析总飞行时长
             flight_consume = container.ele('css:.flight-consume', timeout=1)
@@ -989,10 +1130,9 @@ class FlightRouteSearcher:
     
     def close(self):
         """关闭浏览器（如果还有运行中的实例）"""
-        if self.page:
+        if self.page or self._browser_proc:
             try:
-                self.page.quit()
-                self.page = None
+                self._close_page()
                 logger.info("浏览器已关闭")
             except Exception as e:
                 logger.debug(f"关闭浏览器时出错: {e}")
