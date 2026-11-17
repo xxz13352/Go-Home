@@ -29,7 +29,15 @@ const API_BASE = 'https://kyfw.12306.cn';
 const SEARCH_API_BASE = 'https://search.12306.cn';
 const WEB_URL = 'https://www.12306.cn/index/';
 const LCQUERY_INIT_URL = 'https://kyfw.12306.cn/otn/lcQuery/init';
-const LCQUERY_PATH = await getLCQueryPath();
+// 12306 已把 /otn/lcQuery/init 重定向到登录页，取不到 lc_search_url 时不应让整个服务崩溃。
+// 该路径仅用于「中转换乘票」查询，主查询（余票）不依赖它。
+const LCQUERY_PATH = await getLCQueryPath().catch((error) => {
+    console.error(
+        'Warn: get lc query path failed, interline ticket query will be unavailable.',
+        error instanceof Error ? error.message : error
+    );
+    return '';
+});
 const MISSING_STATIONS: StationData[] = [
     {
         station_id: '@cdd',
@@ -1260,6 +1268,16 @@ server.tool(
         ) {
             return {
                 content: [{ type: 'text', text: 'Error: Station not found. ' }],
+            };
+        }
+        if (!LCQUERY_PATH) {
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: 'Error: 12306 中转换乘接口不可用（lc_search_url 获取失败），请先使用 get-tickets 查询各段车次。',
+                    },
+                ],
             };
         }
         const queryUrl = `${API_BASE}${LCQUERY_PATH}`;
