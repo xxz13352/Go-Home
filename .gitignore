@@ -65,3 +65,18 @@ browser_data/
 # MCP 服务运行时缓存
 FlightTicketMCP/.flight_cache/
 12306-mcp/.cache/
+
+# 抓取产物与临时工作目录
+out/
+DrissionPage/
+_review/
+_work/
+_check/
+_audit/
+_audit_tmp/
+_numcheck/
+_numcheck2/
+_rawcheck/
+_push_audit/
+bd_*/
+browser_data*/
