@@ -56,9 +56,18 @@ def get_runtime_config():
     else:
         # 开发环境
         PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+        # 优先使用项目内虚拟环境，其次使用当前解释器（避免依赖不存在的固定路径）
+        _venv_python = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
         CONDA_ENV_PATH = r"G:\conda environment\Go-home"
-        PYTHON_EXE = os.path.join(CONDA_ENV_PATH, "python.exe")
-        NODE_EXE = os.path.join(CONDA_ENV_PATH, "node.exe")
+        if os.path.exists(_venv_python):
+            PYTHON_EXE = _venv_python
+        elif os.path.exists(os.path.join(CONDA_ENV_PATH, "python.exe")):
+            PYTHON_EXE = os.path.join(CONDA_ENV_PATH, "python.exe")
+        else:
+            PYTHON_EXE = sys.executable
+        # Node.js：优先 PATH，其次 conda 环境
+        import shutil
+        NODE_EXE = shutil.which("node") or os.path.join(CONDA_ENV_PATH, "node.exe")
         FLIGHT_MCP_EXE = None  # 开发环境使用 python -m 模式
         TRAIN_MCP_SCRIPT = os.path.join(PROJECT_ROOT, "12306-mcp", "build", "index.js")
 
@@ -130,7 +139,9 @@ class MCPClientWorker:
         server_params = StdioServerParameters(
             command=self.command[0],
             args=self.command[1:] if len(self.command) > 1 else [],
-            cwd=self.cwd
+            cwd=self.cwd,
+            # 传递完整环境变量（代理、浏览器调试端口等）
+            env=dict(os.environ),
         )
 
         try:
